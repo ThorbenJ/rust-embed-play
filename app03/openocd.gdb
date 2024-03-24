@@ -38,3 +38,8 @@ load
 
 # start the process but immediately halt the processor
 stepi
+# start
+
+# monitor rtt setup 0x20000000 40960 Terminal
+# monitor rtt stop
+# monitor rtt start
