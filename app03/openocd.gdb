@@ -19,7 +19,18 @@ break rust_begin_unwind
 # *try* to stop at the user entry point (it might be gone due to inlining)
 break main
 
-monitor arm semihosting enable
+# monitor arm semihosting enable
+
+# Initialize monitoring so iprintln! macro output
+# is sent from the itm port to itm.txt
+# monitor tpiu config internal itm.txt uart off 8000000
+
+monitor stm32f3x.tpiu disable
+monitor stm32f3x.tpiu configure -protocol uart -traceclk 36000000 -output itm.txt -formatter off
+monitor stm32f3x.tpiu enable
+
+# Turn on the itm port
+monitor itm port 0 on
 
 # # send captured ITM to the file itm.fifo
 # # (the microcontroller SWO pin must be connected to the programmer SWO pin)
