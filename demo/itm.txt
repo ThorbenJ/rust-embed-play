@@ -1,0 +1,12 @@
+init start
+init end
+Spin1 speed -15 delay 2250
+Spin1 speed -15 delay 2250
+Spin1 speed -15 delay 2250
+init start
+init end
+Spin1 speed -15 delay 2250
+Spin1 speed -15 delay 2250
+Spin1 speed -15 delay 2250
+Spin1 speed -15 delay 2250
+Spin1 speed -15 delay 2250
