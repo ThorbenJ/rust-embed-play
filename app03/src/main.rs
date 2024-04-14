@@ -9,16 +9,21 @@ use cortex_m::{/*iprint,*/ iprintln};
 use stm32f3xx_hal::prelude::*;
 use stm32f3xx_hal::{gpio , i2c, pac} ; 
 use rtic_monotonics::Monotonic;
+use rtic_monotonics::systick::*;
 
 #[app(device = stm32f3xx_hal::pac, peripherals = true, dispatchers = [TIM2, TIM3, TIM4])]
 mod app {
     use super::*;
-    use rtic_monotonics::systick::*;
+    
+    const LONG_PRESS:u32 = 500; //long button press time ms
     
     // pub needed for #[app... ]
     #[derive(PartialEq, Copy, Clone)]
     pub enum Demo {
-        Spin,
+        Spin1 = 0,
+        Spin3,
+        Spin5,
+        Spin7,
         Compass,
         Accelero,
     }
@@ -27,9 +32,12 @@ mod app {
         fn next(&self) -> Self {
             use Demo::*;
             match *self {
-                Spin => Compass,
+                Spin1 => Spin3,
+                Spin3 => Spin5,
+                Spin5 => Spin7,
+                Spin7 => Compass,
                 Compass => Accelero,
-                Accelero => Spin,
+                Accelero => Spin1,
             }
         }
     }
@@ -117,15 +125,7 @@ mod app {
         
         let i2c1: &'static pac::i2c1::RegisterBlock = unsafe {&*(pac::I2C1::ptr() ) };
         
-        compass::init_compass(&i2c1);
-        
-        // let offset = compass::get_mag_offset(&i2c1);
-        // iprintln!(&mut itm.stim[0], "Compass (magnetic) offsets {}, {}, {}", offset.0, offset.1, offset.2);
-        
-        
-        //------------- Accelo -------------
-        
-        compass::init_accelo(i2c1);
+        init2::spawn().ok();
         
         //------------ Complete -------------
         demo_select::spawn().ok();
@@ -136,7 +136,7 @@ mod app {
                 itm,
                 led,
                 i2c1,
-                demo: Demo::Spin,
+                demo: Demo::Spin1,
                 submode: 0,
             },
             Local {
@@ -145,8 +145,20 @@ mod app {
             }
         )
     }
+
+    // async spreads like wild fire, including to the compass=::__init functions
+    // But how to call them from the main init function?
+    #[task( shared = [i2c1] )]
+    async fn init2(mut cx: init2::Context) {
+        // async closure would be nice, but alas.
+        let fut = cx.shared.i2c1.lock(|i2c1| {
+            ( compass::init_magneto(i2c1), compass::init_accelo(i2c1) )
+        });
+        fut.0.await;
+        fut.1.await;
+    }
     
-    #[task(shared = [demo, led])]
+    #[task(shared = [demo, submode, led])]
     async fn demo_select(mut cx: demo_select::Context) {
         cx.shared.led.lock(|led| {
             for l in 0..8 {
@@ -154,10 +166,12 @@ mod app {
             }
         });
         
+        cx.shared.submode.lock(|sm| *sm = 0 );
+        
         cx.shared.demo.lock(|dm| {
             use Demo::*;
             match dm {
-                Spin => spin_demo::spawn().ok(),
+                Spin1|Spin3|Spin5|Spin7 => spin_demo::spawn().ok(),
                 Compass => compass_demo::spawn().ok(),
                 Accelero => accelo_demo::spawn().ok(),
             };
@@ -178,7 +192,7 @@ mod app {
             bt = Some(now);
         } else {
 
-            if (now - bt.unwrap()).to_millis() > 500 {
+            if (now - bt.unwrap()).to_millis() > LONG_PRESS {
                 cx.shared.itm.lock(|itm| { iprintln!(&mut itm.stim[0] ,"Long button press") });
                 cx.shared.demo.lock(|dm| { *dm = dm.next(); });
                 
@@ -202,11 +216,11 @@ mod app {
         while Demo::Compass == cx.shared.demo.lock(|d| *d) {
             
             let direction = cx.shared.i2c1.lock(|i2c1| {
-                compass::get_compass_xy_deg(i2c1)
-            });
+                compass::get_magneto_xy_deg(i2c1)
+            }).await;
             
             // let (direction, rad, xyz) = cx.shared.i2c1.lock(|i2c1| {
-            //     (compass::get_compass_xy_deg(i2c1), compass::get_compass_xy_rad(i2c1), compass::get_compass_coord(i2c1))
+            //     (compass::get_magneto_xy_deg(i2c1), compass::get_magneto_xy_rad(i2c1), compass::get_magneto_coord(i2c1))
             // });
             
             res.lock(|itm, led| {
@@ -240,7 +254,7 @@ mod app {
                 }
             }
             
-            let (x, y, d) = cx.shared.i2c1.lock(|i2c1| { compass::get_accelo_xy_and_deg(i2c1) });
+            let (x, y, d) = cx.shared.i2c1.lock(|i2c1| { compass::get_accelo_xy_and_deg(i2c1) }).await;
             
             if x.abs() > 10000 || y.abs() > 10000 {
                 
@@ -262,28 +276,40 @@ mod app {
     async fn spin_demo(mut cx: spin_demo::Context) {
 
         let mut s:usize = 0;
-        while Demo::Spin == cx.shared.demo.lock(|d| *d) {
+        let mut i:usize = 0;
+        while cx.shared.demo.lock(|d| match *d {
+            Demo::Spin1 => { s = 1; true },
+            Demo::Spin3 => { s = 3; true },
+            Demo::Spin5 => { s = 5; true },
+            Demo::Spin7 => { s = 7; true },
+            _ => { false }
+        } ) {
 
-            let m: usize = cx.shared.submode.lock(|submode| { *submode %= 16; return *submode });
-            cx.shared.itm.lock(|itm| iprintln!(&mut itm.stim[0] ,"Spin mode {}", m));
+            let m: i32 = cx.shared.submode.lock(|sm| { *sm %= 31; (*sm as i32 - 15) as i32 });
+            let mut d:u32 = m.abs() as u32;
+            if d==0 { d=333 } else { d = d*d*10 }
+            
+            cx.shared.itm.lock(|itm| iprintln!(&mut itm.stim[0] ,"Spin{} speed {} delay {}", s, m, d));
             
             // let n: usize = (s+m)%8;
-            let b: usize = (s+16-m)%8;
+            let b: usize = (i+8-s)%8;
             
             cx.shared.led.lock(|led| {
-                if m/8 > 0 {
+                if m>0 {
                     //anti-clockwise
                     led[7-b].set_low().unwrap();
-                    led[7-s].set_high().unwrap();
-                } else {
+                    led[7-i].set_high().unwrap();
+                } else if m<0 {
                     //clockwise
                     led[b].set_low().unwrap();
-                    led[s].set_high().unwrap();
+                    led[i].set_high().unwrap();
                 }
+                // if m==0 do nothing
             });
         
-            s = (s+1)%8;
-            Systick::delay(333.millis()).await;
+            i = (i+1)%8;
+
+            Systick::delay(d.millis()).await;
         }
     }
     
@@ -312,40 +338,43 @@ mod compass {
     const M_WHO_AM_I_TOKEN: u8 = 0x40; //0b0100_0000;
     const A_WHO_AM_I_TOKEN: u8 = 0x33; //0b0011_0011
     
-    //============= Compass =======================
+    //============= Magneto Compass =======================
     
-    pub fn init_compass(i2c1: &pac::i2c1::RegisterBlock) {
+    pub async fn init_magneto(i2c1: &pac::i2c1::RegisterBlock) {
         let mut _bytes: [u8;3] = [0;3];
         
-        _bytes[0] = read_byte(i2c1, MAGNETOMETER, M_WHO_AM_I_BANK );
+        _bytes[0] = read_byte(i2c1, MAGNETOMETER, M_WHO_AM_I_BANK ).await;
         assert_eq!(M_WHO_AM_I_TOKEN, _bytes[0]);
         
         // Inistialised using hints from sect. 4.1.5 (Self-test proceedure)
-        write_bytes(i2c1, MAGNETOMETER, M_CFG_REG_A_BANK, &[0x80, 0x00, 0x10]);
-        read_bytes(i2c1, MAGNETOMETER, M_CFG_REG_A_BANK, &mut _bytes);
+        write_bytes(i2c1, MAGNETOMETER, M_CFG_REG_A_BANK, &[0x80, 0x00, 0x10]).await;
+        read_bytes(i2c1, MAGNETOMETER, M_CFG_REG_A_BANK, &mut _bytes).await;
         assert_eq!(0x80, _bytes[0]);
         assert_eq!(0x00, _bytes[1]);
         assert_eq!(0x10, _bytes[2]);
     }
     
-    pub fn get_mag_offset(i2c1: &pac::i2c1::RegisterBlock) -> (i16, i16, i16) {
+    #[allow(dead_code)]
+    pub async fn get_mag_offset(i2c1: &pac::i2c1::RegisterBlock) -> (i16, i16, i16) {
         let mut data: [u8;6] = [0;6];
         
-        read_bytes(i2c1, MAGNETOMETER, M_OFFSET_X_REG_L_BANK, &mut data);
+        read_bytes(i2c1, MAGNETOMETER, M_OFFSET_X_REG_L_BANK, &mut data).await;
 
         bytes_to_coord(&data)
     }
     
     // In Rust 2024 you can't &mut a static. The current warning recommends using addr_of_mut!()
     // However that is in std, and this is a no_std application =/
+    // To get good/reasonable results we need to track min/max values an apply a reading offset
+    // This does require rotating the compass once before getting a good reading
     #[allow(static_mut_refs)]
-    pub fn get_compass_coord(i2c1: &pac::i2c1::RegisterBlock) -> (i16, i16, i16) {
+    pub async fn get_magneto_xyz(i2c1: &pac::i2c1::RegisterBlock) -> (i16, i16, i16) {
         let mut data: [u8;6] = [0;6];
         
         // Expect to be on a single core cortex-m4
         static mut MINMAX: [i16; 6] = [i16::MAX, i16::MIN, i16::MAX, i16::MIN, i16::MAX, i16::MIN];
         
-        read_bytes(i2c1, MAGNETOMETER, M_OUTX_L_REG_BANK, &mut data);
+        read_bytes(i2c1, MAGNETOMETER, M_OUTX_L_REG_BANK, &mut data).await;
 
         let mut xyz = bytes_to_coord(&data);
         
@@ -356,66 +385,69 @@ mod compass {
         xyz
     }
     
-    pub fn get_compass_xy(i2c1: &pac::i2c1::RegisterBlock) -> (i16,i16) {
-        xyz_to_xy( get_compass_coord(i2c1) )
+    pub async fn get_magneto_xy(i2c1: &pac::i2c1::RegisterBlock) -> (i16,i16) {
+        xyz_to_xy( get_magneto_xyz(i2c1).await )
     }
     
-    pub fn get_compass_xy_rad(i2c1: &pac::i2c1::RegisterBlock) -> f32 {
-        xy_to_rad( get_compass_xy(i2c1) )
+    pub async fn get_magneto_xy_rad(i2c1: &pac::i2c1::RegisterBlock) -> f32 {
+        xy_to_rad( get_magneto_xy(i2c1).await )
     }
     
-    pub fn get_compass_xy_deg(i2c1: &pac::i2c1::RegisterBlock) -> u16 {
-        rad_to_deg( get_compass_xy_rad(i2c1) )
+    pub async fn get_magneto_xy_deg(i2c1: &pac::i2c1::RegisterBlock) -> u16 {
+        rad_to_deg( get_magneto_xy_rad(i2c1).await )
     }
     
-    pub fn get_compass_xy_and_deg(i2c1: &pac::i2c1::RegisterBlock) -> (i16, i16, u16) {
-        let xy = get_compass_xy(i2c1);
+    #[allow(dead_code)]
+    pub async fn get_magneto_xy_and_deg(i2c1: &pac::i2c1::RegisterBlock) -> (i16, i16, u16) {
+        let xy = get_magneto_xy(i2c1).await;
         ( xy.0, xy.1, rad_to_deg(xy_to_rad(xy) ) )
     }
     
     //================== Accelo' ========================
     
-    pub fn init_accelo(i2c1: &pac::i2c1::RegisterBlock) {
+    pub async fn init_accelo(i2c1: &pac::i2c1::RegisterBlock) {
         let mut _bytes: [u8;3] = [0;3];
         
-        _bytes[0] = read_byte(i2c1, ACCELEROMETER, A_WHO_AM_I_BANK );
+        _bytes[0] = read_byte(i2c1, ACCELEROMETER, A_WHO_AM_I_BANK ).await;
         assert_eq!(A_WHO_AM_I_TOKEN, _bytes[0]);
         
-        write_bytes(i2c1, ACCELEROMETER, A_CTRL_REG2_BANK, &[0x00, 0x00, 0x80]);
-        read_bytes(i2c1, ACCELEROMETER, A_CTRL_REG2_BANK, &mut _bytes);
+        write_bytes(i2c1, ACCELEROMETER, A_CTRL_REG2_BANK, &[0x00, 0x00, 0x80]).await;
+        read_bytes(i2c1, ACCELEROMETER, A_CTRL_REG2_BANK, &mut _bytes).await;
         assert_eq!(0x00, _bytes[0]);
         assert_eq!(0x00, _bytes[1]);
         assert_eq!(0x80, _bytes[2]);
         
         //Self-test plan Sect. 4.2.4 uses this bank sequence to initialise
-        write_byte(i2c1, ACCELEROMETER, A_CTRL_REG1_BANK, 0x57);
-        _bytes[0] = read_byte(i2c1, ACCELEROMETER, A_CTRL_REG1_BANK);
+        write_byte(i2c1, ACCELEROMETER, A_CTRL_REG1_BANK, 0x57).await;
+        _bytes[0] = read_byte(i2c1, ACCELEROMETER, A_CTRL_REG1_BANK).await;
         assert_eq!(0x57, _bytes[0]);
     }
 
     #[allow(static_mut_refs)]
-    pub fn get_accelo_coord(i2c1: &pac::i2c1::RegisterBlock) -> (i16, i16, i16) {
+    pub async fn get_accelo_xyz(i2c1: &pac::i2c1::RegisterBlock) -> (i16, i16, i16) {
         let mut data: [u8;6] = [0;6];
         
-        read_bytes(i2c1, ACCELEROMETER, A_OUT_X_L_BANK, &mut data);
+        read_bytes(i2c1, ACCELEROMETER, A_OUT_X_L_BANK, &mut data).await;
 
         bytes_to_coord(&data)
     }
     
-    pub fn get_accelo_xy(i2c1: &pac::i2c1::RegisterBlock) -> (i16,i16) {
-        xyz_to_xy( get_accelo_coord(i2c1) )
+    pub async fn get_accelo_xy(i2c1: &pac::i2c1::RegisterBlock) -> (i16,i16) {
+        xyz_to_xy( get_accelo_xyz(i2c1).await )
     }
     
-    pub fn get_accelo_xy_rad(i2c1: &pac::i2c1::RegisterBlock) -> f32 {
-        xy_to_rad( get_accelo_xy(i2c1) )
+    #[allow(dead_code)]
+    pub async fn get_accelo_xy_rad(i2c1: &pac::i2c1::RegisterBlock) -> f32 {
+        xy_to_rad( get_accelo_xy(i2c1).await )
     }
     
-    pub fn get_accelo_xy_deg(i2c1: &pac::i2c1::RegisterBlock) -> u16 {
-        rad_to_deg( get_accelo_xy_rad(i2c1) )
+    #[allow(dead_code)]
+    pub async fn get_accelo_xy_deg(i2c1: &pac::i2c1::RegisterBlock) -> u16 {
+        rad_to_deg( get_accelo_xy_rad(i2c1).await )
     }
     
-    pub fn get_accelo_xy_and_deg(i2c1: &pac::i2c1::RegisterBlock) -> (i16, i16, u16) {
-        let xy = get_accelo_xy(i2c1);
+    pub async fn get_accelo_xy_and_deg(i2c1: &pac::i2c1::RegisterBlock) -> (i16, i16, u16) {
+        let xy = get_accelo_xy(i2c1).await;
         ( xy.0, xy.1, rad_to_deg(xy_to_rad(xy) ) )
     }
     
@@ -445,15 +477,15 @@ mod compass {
         if xyz.2 > minmax[5] { minmax[5] = xyz.2 };
         
         let range: (i16,i16,i16) = (
-            if minmax[1] - minmax[0] > 0 { minmax[1] - minmax[0] } else { 2 },
-            if minmax[3] - minmax[2] > 0 { minmax[3] - minmax[2] } else { 2 },
-            if minmax[5] - minmax[4] > 0 { minmax[5] - minmax[4] } else { 2 }
+            if minmax[1] > minmax[0] { minmax[1] - minmax[0] } else { 2 },
+            if minmax[3] > minmax[2] { minmax[3] - minmax[2] } else { 2 },
+            if minmax[5] > minmax[4] { minmax[5] - minmax[4] } else { 2 }
         );
         
         (
-            (xyz.0-(minmax[0]+range.0/2)) ,
-            (xyz.1-(minmax[2]+range.1/2)) ,
-            (xyz.2-(minmax[4]+range.2/2)) 
+            (xyz.0 - (minmax[0] + (range.0 / 2) ) ) ,
+            (xyz.1 - (minmax[2] + (range.1 / 2) ) ) ,
+            (xyz.2 - (minmax[4] + (range.2 / 2) ) )
         )
     }
     
@@ -481,14 +513,17 @@ mod compass {
     }
     
     // Return Result?
-    fn read_byte(i2c1: &pac::i2c1::RegisterBlock, addr: u16, bank: u8) -> u8 {
+    async fn read_byte(i2c1: &pac::i2c1::RegisterBlock, addr: u16, bank: u8) -> u8 {
         let mut data: [u8;1] = [0];
-        read_bytes(i2c1, addr, bank, &mut data);
+        read_bytes(i2c1, addr, bank, &mut data).await;
         data[0]
     }
     
+    //I thought it would be nice to yield when doing the i2c waits, but that caused
+    //async to spread everywhere thus making the non-async init and closures painfull...
+    
     //Return Result?
-    fn read_bytes(i2c1: &pac::i2c1::RegisterBlock, addr: u16, bank: u8, data: &mut [u8]) {
+    async fn read_bytes(i2c1: &pac::i2c1::RegisterBlock, addr: u16, bank: u8, data: &mut [u8]) {
        
         i2c1.cr2.write(|w| {
             w.start().set_bit();
@@ -497,11 +532,11 @@ mod compass {
             w.nbytes().bits(1);
             w.autoend().clear_bit()
         });
-        while i2c1.isr.read().txis().bit_is_clear() {};
+        while i2c1.isr.read().txis().bit_is_clear() { Systick::delay(1.micros()).await; };
 
         // MSB = 1 for bank auto increment
         i2c1.txdr.write(|w| w.txdata().bits(bank|0x80));
-        while i2c1.isr.read().tc().bit_is_clear() {};
+        while i2c1.isr.read().tc().bit_is_clear() { Systick::delay(1.micros()).await; };
     
         i2c1.cr2.modify(|_, w| {
             w.start().set_bit();
@@ -512,24 +547,24 @@ mod compass {
         });
 
         for byte in data {
-            while i2c1.isr.read().rxne().bit_is_clear() {}
+            while i2c1.isr.read().rxne().bit_is_clear() { Systick::delay(1.micros()).await; }
             *byte = i2c1.rxdr.read().rxdata().bits()
         };
         
         i2c1.cr2.modify(|_, w| {
             w.stop().set_bit() 
         });
-        while i2c1.isr.read().stopf().bit_is_clear() {}
+        while i2c1.isr.read().stopf().bit_is_clear() { Systick::delay(1.micros()).await; }
         
         i2c1.icr.write(|w| w.stopcf().set_bit());
         
     }
     
-    fn write_byte(i2c1: &pac::i2c1::RegisterBlock, addr: u16, bank: u8, data: u8) {
-        write_bytes(i2c1, addr, bank, &[data]);
+    async fn write_byte(i2c1: &pac::i2c1::RegisterBlock, addr: u16, bank: u8, data: u8) {
+        write_bytes(i2c1, addr, bank, &[data]).await;
     }
     
-    fn write_bytes(i2c1: &pac::i2c1::RegisterBlock, addr: u16, bank: u8, data: &[u8]) {
+    async fn write_bytes(i2c1: &pac::i2c1::RegisterBlock, addr: u16, bank: u8, data: &[u8]) {
         
         i2c1.cr2.write(|w| {
             w.start().set_bit();
@@ -538,21 +573,21 @@ mod compass {
             w.nbytes().bits(1_u8 + (data.len() as u8));
             w.autoend().clear_bit()
         });
-        while i2c1.isr.read().txis().bit_is_clear() {}
+        while i2c1.isr.read().txis().bit_is_clear() { Systick::delay(1.micros()).await; }
 
         // MSB = 1 for bank auto increment
         i2c1.txdr.write(|w| w.txdata().bits(bank|0x80) );
         
         for byte in data {
-            while i2c1.isr.read().txe().bit_is_clear() {}
+            while i2c1.isr.read().txe().bit_is_clear() { Systick::delay(1.micros()).await; }
             i2c1.txdr.write(|w| w.txdata().bits(*byte));
         };
-        while i2c1.isr.read().tc().bit_is_clear() {};
+        while i2c1.isr.read().tc().bit_is_clear() { Systick::delay(1.micros()).await; };
         
         i2c1.cr2.modify(|_, w| {
             w.stop().set_bit() 
         });
-        while i2c1.isr.read().stopf().bit_is_clear() {}
+        while i2c1.isr.read().stopf().bit_is_clear() { Systick::delay(1.micros()).await; }
         
         i2c1.icr.write(|w| w.stopcf().set_bit());
     }
